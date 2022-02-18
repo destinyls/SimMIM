@@ -1,0 +1,2 @@
+python -m torch.distributed.launch --nproc_per_node 8 main_simmim.py \ 
+--cfg configs/swin_tiny__800ep/simmim_pretrain__swin_tiny__img224_window7__800ep.yaml --data-path <imagenet-path>/train --batch-size 128 --output checkpoints/
