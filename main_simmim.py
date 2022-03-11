@@ -8,6 +8,7 @@
 
 import os
 import time
+import math
 import argparse
 import datetime
 import numpy as np
@@ -57,6 +58,11 @@ def parse_option():
 
     # distributed training
     parser.add_argument("--local_rank", type=int, required=True, help='local rank for DistributedDataParallel')
+    parser.add_argument('--moco-m', default=0.99, type=float,
+                    help='moco momentum of updating momentum encoder (default: 0.99)')
+    parser.add_argument('--moco-m-cos', action='store_true',
+                    help='gradually increase moco momentum to 1 with a '
+                         'half-cycle cosine schedule')
 
     args = parser.parse_args()
 
@@ -65,7 +71,7 @@ def parse_option():
     return args, config
 
 
-def main(config):
+def main(config, args=None):
     data_loader_train = build_loader(config, logger, is_pretrain=True)
 
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
@@ -107,7 +113,7 @@ def main(config):
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(config, model, data_loader_train, optimizer, epoch, lr_scheduler)
+        train_one_epoch(config, args, model, data_loader_train, optimizer, epoch, lr_scheduler)
         if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
             save_checkpoint(config, epoch, model_without_ddp, 0., optimizer, lr_scheduler, logger)
 
@@ -116,23 +122,34 @@ def main(config):
     logger.info('Training time {}'.format(total_time_str))
 
 
-def train_one_epoch(config, model, data_loader, optimizer, epoch, lr_scheduler):
+def adjust_moco_momentum(epoch, args, total_epochs):
+    """Adjust moco momentum based on current epoch"""
+    m = 1. - 0.5 * (1. + math.cos(math.pi * epoch / total_epochs)) * (1. - args.moco_m)
+    return m
+
+def train_one_epoch(config, args, model, data_loader, optimizer, epoch, lr_scheduler):
     model.train()
     optimizer.zero_grad()
 
     num_steps = len(data_loader)
     batch_time = AverageMeter()
     loss_meter = AverageMeter()
+    mim_loss_meter = AverageMeter()
+    cl_loss_meter = AverageMeter()
     norm_meter = AverageMeter()
 
+    moco_m = args.moco_m
+    total_epochs = config.TRAIN.EPOCHS
     start = time.time()
     end = time.time()
     for idx, (img, mask, _) in enumerate(data_loader):
         img = img.cuda(non_blocking=True)
         mask = mask.cuda(non_blocking=True)
 
-        loss = model(img, mask)
-
+        if args.moco_m_cos:
+            moco_m = adjust_moco_momentum(epoch + idx / num_steps, args, total_epochs)
+        mim_loss, cl_loss = model(img, mask, moco_m)
+        loss = mim_loss + cl_loss
         if config.TRAIN.ACCUMULATION_STEPS > 1:
             loss = loss / config.TRAIN.ACCUMULATION_STEPS
             if config.AMP_OPT_LEVEL != "O0":
@@ -171,8 +188,9 @@ def train_one_epoch(config, model, data_loader, optimizer, epoch, lr_scheduler):
             lr_scheduler.step_update(epoch * num_steps + idx)
 
         torch.cuda.synchronize()
-
         loss_meter.update(loss.item(), img.size(0))
+        cl_loss_meter.update(cl_loss.item(), img.size(0))
+        mim_loss_meter.update(mim_loss.item(), img.size(0))
         norm_meter.update(grad_norm)
         batch_time.update(time.time() - end)
         end = time.time()
@@ -185,15 +203,16 @@ def train_one_epoch(config, model, data_loader, optimizer, epoch, lr_scheduler):
                 f'Train: [{epoch}/{config.TRAIN.EPOCHS}][{idx}/{num_steps}]\t'
                 f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.6f}\t'
                 f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
-                f'loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
+                f'total_loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
+                f'mim_loss {mim_loss_meter.val:.4f} ({mim_loss_meter.avg:.4f})\t'
+                f'cl_loss {cl_loss_meter.val:.4f} ({cl_loss_meter.avg:.4f})\t'
                 f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
                 f'mem {memory_used:.0f}MB')
     epoch_time = time.time() - start
     logger.info(f"EPOCH {epoch} training takes {datetime.timedelta(seconds=int(epoch_time))}")
 
-
 if __name__ == '__main__':
-    _, config = parse_option()
+    args, config = parse_option()
 
     if config.AMP_OPT_LEVEL != "O0":
         assert amp is not None, "amp not installed!"
@@ -241,4 +260,4 @@ if __name__ == '__main__':
     # print config
     logger.info(config.dump())
 
-    main(config)
+    main(config, args)
