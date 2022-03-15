@@ -27,8 +27,9 @@ class SwinTransformerForSimMIM(SwinTransformer):
         trunc_normal_(self.mask_token, mean=0., std=.02)
         
         self.neck = DeconvUp(input_channels=self.num_features)
+        '''
         self.projector = build_linear(num_layers=2, input_dim=self.neck.out_channels, mlp_dim=1024, output_dim=64)
- 
+        '''
     def forward(self, x, mask=None):
         x = self.patch_embed(x)
         B, L, _ = x.shape
@@ -47,8 +48,10 @@ class SwinTransformerForSimMIM(SwinTransformer):
         B, C, L = x.shape
         H = W = int(L ** 0.5)
         x = x.reshape(B, C, H, W)
-        z = self.neck(x)   
+        out_projector = self.neck(x)   
+        '''
         out_projector = self.projector(z)
+        '''
         return x, out_projector
 
     @torch.jit.ignore
@@ -104,10 +107,12 @@ class SimMIM(nn.Module):
         projector = self._build_mlp(num_layers=3, input_dim=neck.out_channels, mlp_dim=4096, output_dim=256)
         '''
         self.encoder = encoder
+        '''
         self.momentum_encoder = copy.deepcopy(self.encoder)
         for param_b, param_m in zip(self.encoder.parameters(), self.momentum_encoder.parameters()):
             param_m.data.copy_(param_b.data)  # initialize
             param_m.requires_grad = False  # not update by gradient
+        '''
         self.encoder_stride = encoder_stride
         self.decoder = nn.Sequential(
             nn.Conv2d(
@@ -115,29 +120,40 @@ class SimMIM(nn.Module):
                 out_channels=self.encoder_stride ** 2 * 3, kernel_size=1),
             nn.PixelShuffle(self.encoder_stride),
         )
+
+        self.cnn_decoder = nn.Sequential(
+            nn.Conv2d(in_channels=64, out_channels=4 ** 2 * 3, kernel_size=1),
+            nn.PixelShuffle(4),
+        )
+
         self.in_chans = self.encoder.in_chans
         self.patch_size = self.encoder.patch_size
-        self.use_momentum = True
+        '''
         self.predictor = build_linear(num_layers=2, input_dim=64, mlp_dim=1024, output_dim=64, last_bn=False)
+        '''
         self.T = 1.0
 
     def forward(self, x, mask, m=0.99):
         z, q = self.encoder(x, mask)
+        '''
         q = self.predictor(q)
+        '''
         x_rec = self.decoder(z)
+        q_x_rec = self.cnn_decoder(q)
+        '''
         with torch.no_grad():  # no gradient
             self._update_momentum_encoder(m)  # update the momentum encoder
             # compute momentum features as targets
             _, k = self.momentum_encoder(x)
-
-        mask_up = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
+        '''
+        mask = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
         loss_recon = F.l1_loss(x, x_rec, reduction='none')
-        mim_loss = (loss_recon * mask_up).sum() / (mask_up.sum() + 1e-5) / self.in_chans
+        mim_loss = (loss_recon * mask).sum() / (mask.sum() + 1e-5) / self.in_chans
         
-        mask = mask.unsqueeze(1).contiguous()
-        loss_contrast = F.l1_loss(q, k, reduction='none')
-        contrast_loss = (loss_contrast * mask).sum() / (mask.sum() + 1e-5) / 64
-        return mim_loss, contrast_loss
+        loss_cnn_mim = F.l1_loss(x, q_x_rec, reduction='none')
+        loss_cnn_mim = (loss_cnn_mim * mask).sum() / (mask.sum() + 1e-5) / self.in_chans
+
+        return mim_loss, loss_cnn_mim
     
     @torch.jit.ignore
     def no_weight_decay(self):
