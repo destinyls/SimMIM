@@ -20,4 +20,4 @@ TRAIN:
   WEIGHT_DECAY: 0.05
 PRINT_FREQ: 100
 SAVE_FREQ: 5
-TAG: simmim_pretrain__swin_base__img192_window6__100ep
+TAG: simmim_pretrain__swin_base__img192_window6__neck_cl_globalavgpool_byol_data_aug__100ep

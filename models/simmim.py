@@ -13,11 +13,41 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import trunc_normal_
+from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
 from .swin_transformer import SwinTransformer
 from .vision_transformer import VisionTransformer
 
 from .deconv_up import DeconvUp
+
+image_size = 192
+DEFAULT_AUG = torch.nn.Sequential(
+    RandomApply(
+        T.ColorJitter(0.8, 0.8, 0.8, 0.2),
+        p = 0.3
+    ),
+    T.RandomGrayscale(p=0.2),
+    T.RandomHorizontalFlip(),
+    RandomApply(
+        T.GaussianBlur((3, 3), (1.0, 2.0)),
+        p = 0.2
+    ),
+    T.RandomResizedCrop((image_size, image_size)),
+    T.Normalize(mean=torch.tensor(IMAGENET_DEFAULT_MEAN),std=torch.tensor(IMAGENET_DEFAULT_STD)),
+)
+
+class MLP(nn.Module):
+    def __init__(self, dim, projection_size, hidden_size = 4096):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_size, projection_size)
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 class SwinTransformerForSimMIM(SwinTransformer):
     def __init__(self, **kwargs):
@@ -27,9 +57,9 @@ class SwinTransformerForSimMIM(SwinTransformer):
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         trunc_normal_(self.mask_token, mean=0., std=.02)
         self.neck = DeconvUp(input_channels=self.num_features)
-        self.projector = build_mlp(num_layers=3, input_dim=self.neck.out_channels, mlp_dim=4096, output_dim=256)
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        
+        self.projector = MLP(dim=self.neck.out_channels, projection_size=256)
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+
     def forward(self, x, mask=None):
         x = self.patch_embed(x)
         B, L, _ = x.shape
@@ -55,7 +85,7 @@ class SwinTransformerForSimMIM(SwinTransformer):
         # stop gradient propagation
         z = self.neck(x)
         z = self.avg_pool(z)
-        z = z.view(z.shape[0], -1)
+        z = output.view(z.size(0), -1)
         out_projector = self.projector(z)
 
         return x, out_projector
@@ -129,24 +159,33 @@ class SimMIM(nn.Module):
         self.in_chans = self.encoder.in_chans
         self.patch_size = self.encoder.patch_size
         self.use_momentum = True
-        self.predictor = build_mlp(num_layers=2, input_dim=256, mlp_dim=4096, output_dim=256, last_bn=False)
+        self.predictor = MLP(dim=self.neck.out_channels, projection_size=256)
         self.T = 1.0
 
+        augment_fn = T.Normalize(mean=torch.tensor(IMAGENET_DEFAULT_MEAN),std=torch.tensor(IMAGENET_DEFAULT_STD))
+        self.augment1 = default(augment_fn, DEFAULT_AUG)
+        self.augment2 = default(None, DEFAULT_AUG)
+
     def forward(self, x, mask, m=0.99):
-        z, q = self.encoder(x, mask)
+        image_one, image_two = self.augment1(x), self.augment2(x)
+        z, q = self.encoder(image_one, mask)
         q = self.predictor(q)
         x_rec = self.decoder(z)
 
         with torch.no_grad():  # no gradient
             self._update_momentum_encoder(m)  # update the momentum encoder
             # compute momentum features as targets
-            _, k = self.momentum_encoder(x)
+            _, k = self.momentum_encoder(image_two)
+            k.detach_()
 
         mask = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
         loss_recon = F.l1_loss(x, x_rec, reduction='none')
         mim_loss = (loss_recon * mask).sum() / (mask.sum() + 1e-5) / self.in_chans
 
+        '''
         cl_loss = self.contrastive_loss(q, k)
+        '''
+        cl_loss = self.loss_fn(q, k)
         return mim_loss, cl_loss * 0.1
     
     @torch.jit.ignore
@@ -179,6 +218,10 @@ class SimMIM(nn.Module):
         labels = (torch.arange(N, dtype=torch.long) + N * torch.distributed.get_rank()).cuda()
         return nn.CrossEntropyLoss()(logits, labels) * (2 * self.T)
 
+    def loss_fn(x, y):
+        x = F.normalize(x, dim=-1, p=2)
+        y = F.normalize(y, dim=-1, p=2)
+        return 2 - 2 * (x * y).sum(dim=-1)
 
 def build_simmim(config):
     model_type = config.MODEL.TYPE
@@ -228,23 +271,6 @@ def build_simmim(config):
 
     return model
 
-def build_mlp(num_layers, input_dim, mlp_dim, output_dim, last_bn=True):
-    mlp = []
-    for l in range(num_layers):
-        dim1 = input_dim if l == 0 else mlp_dim
-        dim2 = output_dim if l == num_layers - 1 else mlp_dim
-
-        mlp.append(nn.Linear(dim1, dim2, bias=False))
-
-        if l < num_layers - 1:
-            mlp.append(nn.BatchNorm1d(dim2))
-            mlp.append(nn.ReLU(inplace=True))
-        elif last_bn:
-            # follow SimCLR's design: https://github.com/google-research/simclr/blob/master/model_util.py#L157
-            # for simplicity, we further removed gamma in BN
-            mlp.append(nn.BatchNorm1d(dim2, affine=False))
-
-    return nn.Sequential(*mlp)
 
 @torch.no_grad()
 def concat_all_gather(tensor):
@@ -258,3 +284,6 @@ def concat_all_gather(tensor):
 
     output = torch.cat(tensors_gather, dim=0)
     return output
+
+def default(val, def_val):
+    return def_val if val is None else val
