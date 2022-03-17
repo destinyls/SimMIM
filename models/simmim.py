@@ -118,7 +118,7 @@ class SimMIM(nn.Module):
         self.in_chans = self.encoder.in_chans
         self.patch_size = self.encoder.patch_size
         self.use_momentum = True
-        self.predictor = build_linear(num_layers=2, input_dim=64, mlp_dim=1024, output_dim=64, last_bn=False)
+        self.predictor = build_linear(num_layers=2, input_dim=64, mlp_dim=1024, output_dim=64)
         self.T = 1.0
 
     def forward(self, x, mask, m=0.99):
@@ -135,7 +135,7 @@ class SimMIM(nn.Module):
         mim_loss = (loss_recon * mask_up).sum() / (mask_up.sum() + 1e-5) / self.in_chans
         
         mask = mask.unsqueeze(1).contiguous()
-        loss_contrast = F.l1_loss(q, k, reduction='none')
+        loss_contrast = loss_fn(q, k, reduction='none')
         contrast_loss = (loss_contrast * mask).sum() / (mask.sum() + 1e-5) / 64
         return mim_loss, contrast_loss
     
@@ -205,7 +205,7 @@ def build_simmim(config):
 
     return model
 
-def build_linear(num_layers, input_dim, mlp_dim, output_dim, last_bn=True):
+def build_linear(num_layers, input_dim, mlp_dim, output_dim):
     mlp = []
     for l in range(num_layers):
         dim1 = input_dim if l == 0 else mlp_dim
@@ -214,8 +214,9 @@ def build_linear(num_layers, input_dim, mlp_dim, output_dim, last_bn=True):
         if l < num_layers - 1:
             mlp.append(nn.BatchNorm2d(dim2))
             mlp.append(nn.ReLU(inplace=True))
-        elif last_bn:
-            # follow SimCLR's design: https://github.com/google-research/simclr/blob/master/model_util.py#L157
-            # for simplicity, we further removed gamma in BN
-            mlp.append(nn.BatchNorm2d(dim2, affine=False))
     return nn.Sequential(*mlp)
+
+def loss_fn(x, y):
+    x = F.normalize(x, dim=1, p=2)
+    y = F.normalize(y, dim=1, p=2)
+    return F.mse_loss(x, y, reduction='none')
