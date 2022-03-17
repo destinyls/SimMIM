@@ -12,6 +12,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms as T
 from timm.models.layers import trunc_normal_
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
@@ -19,6 +20,30 @@ from .swin_transformer import SwinTransformer
 from .vision_transformer import VisionTransformer
 
 from .deconv_up import DeconvUp
+
+
+class RandomApply(nn.Module):
+    def __init__(self, fn, p):
+        super().__init__()
+        self.fn = fn
+        self.p = p
+    def forward(self, x):
+        if random.random() > self.p:
+            return x
+        return self.fn(x)
+
+class MLP(nn.Module):
+    def __init__(self, dim, projection_size, hidden_size = 4096):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_size, projection_size)
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 image_size = 192
 DEFAULT_AUG = torch.nn.Sequential(
@@ -35,19 +60,6 @@ DEFAULT_AUG = torch.nn.Sequential(
     T.RandomResizedCrop((image_size, image_size)),
     T.Normalize(mean=torch.tensor(IMAGENET_DEFAULT_MEAN),std=torch.tensor(IMAGENET_DEFAULT_STD)),
 )
-
-class MLP(nn.Module):
-    def __init__(self, dim, projection_size, hidden_size = 4096):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden_size),
-            nn.BatchNorm1d(hidden_size),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_size, projection_size)
-        )
-
-    def forward(self, x):
-        return self.net(x)
 
 class SwinTransformerForSimMIM(SwinTransformer):
     def __init__(self, **kwargs):
@@ -85,7 +97,7 @@ class SwinTransformerForSimMIM(SwinTransformer):
         # stop gradient propagation
         z = self.neck(x)
         z = self.avg_pool(z)
-        z = output.view(z.size(0), -1)
+        z = z.view(z.size(0), -1)
         out_projector = self.projector(z)
 
         return x, out_projector
@@ -159,7 +171,7 @@ class SimMIM(nn.Module):
         self.in_chans = self.encoder.in_chans
         self.patch_size = self.encoder.patch_size
         self.use_momentum = True
-        self.predictor = MLP(dim=self.neck.out_channels, projection_size=256)
+        self.predictor = MLP(dim=256, projection_size=256)
         self.T = 1.0
 
         augment_fn = T.Normalize(mean=torch.tensor(IMAGENET_DEFAULT_MEAN),std=torch.tensor(IMAGENET_DEFAULT_STD))
@@ -180,13 +192,13 @@ class SimMIM(nn.Module):
 
         mask = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
         loss_recon = F.l1_loss(x, x_rec, reduction='none')
-        mim_loss = (loss_recon * mask).sum() / (mask.sum() + 1e-5) / self.in_chans
+        mim_loss = (loss_recon * m ask).sum() / (mask.sum() + 1e-5) / self.in_chans
 
         '''
         cl_loss = self.contrastive_loss(q, k)
         '''
-        cl_loss = self.loss_fn(q, k)
-        return mim_loss, cl_loss * 0.1
+        cl_loss = self.loss_fn(q, k).mean()
+        return mim_loss, cl_loss
     
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -218,7 +230,7 @@ class SimMIM(nn.Module):
         labels = (torch.arange(N, dtype=torch.long) + N * torch.distributed.get_rank()).cuda()
         return nn.CrossEntropyLoss()(logits, labels) * (2 * self.T)
 
-    def loss_fn(x, y):
+    def loss_fn(self, x, y):
         x = F.normalize(x, dim=-1, p=2)
         y = F.normalize(y, dim=-1, p=2)
         return 2 - 2 * (x * y).sum(dim=-1)
