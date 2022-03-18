@@ -21,16 +21,42 @@ from .vision_transformer import VisionTransformer
 
 from .deconv_up import DeconvUp
 
+class MultiCropWrapper(nn.Module):
+    """
+    Perform forward pass separately on each resolution input.
+    The inputs corresponding to a single resolution are clubbed and single
+    forward is run on the same resolution inputs. Hence we do several
+    forward passes = number of different resolutions used. We then
+    concatenate all the output features and run the head forward on these
+    concatenated features.
+    """
+    def __init__(self, backbone, head):
+        super(MultiCropWrapper, self).__init__()
+        # disable layers dedicated to ImageNet labels classification
+        backbone.fc, backbone.head = nn.Identity(), nn.Identity()
+        self.backbone = backbone
+        self.head = head
 
-class RandomApply(nn.Module):
-    def __init__(self, fn, p):
-        super().__init__()
-        self.fn = fn
-        self.p = p
     def forward(self, x):
-        if random.random() > self.p:
-            return x
-        return self.fn(x)
+        # convert to list
+        if not isinstance(x, list):
+            x = [x]
+        idx_crops = torch.cumsum(torch.unique_consecutive(
+            torch.tensor([inp.shape[-1] for inp in x]),
+            return_counts=True,
+        )[1], 0)
+        start_idx, output = 0, torch.empty(0).to(x[0].device)
+        for end_idx in idx_crops:
+            _out = self.backbone(torch.cat(x[start_idx: end_idx]))
+            # The output is a tuple with XCiT model. See:
+            # https://github.com/facebookresearch/xcit/blob/master/xcit.py#L404-L405
+            if isinstance(_out, tuple):
+                _out = _out[0]
+            # accumulate outputs
+            output = torch.cat((output, _out))
+            start_idx = end_idx
+        # Run the head forward on the concatenated features.
+        return self.head(output)
 
 class MLP(nn.Module):
     def __init__(self, dim, projection_size, hidden_size = 4096):
@@ -44,22 +70,6 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.net(x)
-
-image_size = 192
-DEFAULT_AUG = torch.nn.Sequential(
-    RandomApply(
-        T.ColorJitter(0.8, 0.8, 0.8, 0.2),
-        p = 0.3
-    ),
-    T.RandomGrayscale(p=0.2),
-    T.RandomHorizontalFlip(),
-    RandomApply(
-        T.GaussianBlur((3, 3), (1.0, 2.0)),
-        p = 0.2
-    ),
-    T.RandomResizedCrop((image_size, image_size)),
-    T.Normalize(mean=torch.tensor(IMAGENET_DEFAULT_MEAN),std=torch.tensor(IMAGENET_DEFAULT_STD)),
-)
 
 class SwinTransformerForSimMIM(SwinTransformer):
     def __init__(self, **kwargs):
@@ -172,32 +182,30 @@ class SimMIM(nn.Module):
         self.patch_size = self.encoder.patch_size
         self.use_momentum = True
         self.predictor = MLP(dim=256, projection_size=256)
-        self.T = 1.0
-
-        augment_fn = T.Normalize(mean=torch.tensor(IMAGENET_DEFAULT_MEAN),std=torch.tensor(IMAGENET_DEFAULT_STD))
-        self.augment1 = default(augment_fn, DEFAULT_AUG)
-        self.augment2 = default(None, DEFAULT_AUG)
+        
 
     def forward(self, x, mask, m=0.99):
-        image_one, image_two = self.augment1(x), self.augment2(x)
-        z, q = self.encoder(image_one, mask)
+        global_crop, local_crops = x[0], x[0:]
+        z, q = self.encoder(global_crop, mask)
         q = self.predictor(q)
         x_rec = self.decoder(z)
 
+        mask = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
+        loss_recon = F.l1_loss(global_crop, x_rec, reduction='none')
+        mim_loss = (loss_recon * m ask).sum() / (mask.sum() + 1e-5) / self.in_chans
+
+        momentum_outputs = []
         with torch.no_grad():  # no gradient
             self._update_momentum_encoder(m)  # update the momentum encoder
             # compute momentum features as targets
-            _, k = self.momentum_encoder(image_two)
-            k.detach_()
+            for i in range(len(local_crops)):
+                _, k = self.momentum_encoder(local_crops[i])
+                momentum_outputs.append(k.detach())
 
-        mask = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
-        loss_recon = F.l1_loss(x, x_rec, reduction='none')
-        mim_loss = (loss_recon * m ask).sum() / (mask.sum() + 1e-5) / self.in_chans
-
-        '''
-        cl_loss = self.contrastive_loss(q, k)
-        '''
-        cl_loss = self.loss_fn(q, k).mean()
+        cl_loss = 0
+        for i in range(len(momentum_outputs)):
+            cl_loss += self.loss_fn(q, momentum_outputs[i]).mean()
+        
         return mim_loss, cl_loss
     
     @torch.jit.ignore
@@ -217,18 +225,6 @@ class SimMIM(nn.Module):
         """Momentum update of the momentum encoder"""
         for param_b, param_m in zip(self.encoder.parameters(), self.momentum_encoder.parameters()):
             param_m.data = param_m.data * m + param_b.data * (1. - m)
-
-    def contrastive_loss(self, q, k):
-        # normalize
-        q = nn.functional.normalize(q, dim=1)
-        k = nn.functional.normalize(k, dim=1)
-        # gather all targets
-        k = concat_all_gather(k)
-        # Einstein sum is more intuitive
-        logits = torch.einsum('nc,mc->nm', [q, k]) / self.T
-        N = logits.shape[0]  # batch size per GPU
-        labels = (torch.arange(N, dtype=torch.long) + N * torch.distributed.get_rank()).cuda()
-        return nn.CrossEntropyLoss()(logits, labels) * (2 * self.T)
 
     def loss_fn(self, x, y):
         x = F.normalize(x, dim=-1, p=2)
@@ -282,20 +278,3 @@ def build_simmim(config):
     model = SimMIM(encoder=encoder, encoder_stride=encoder_stride)
 
     return model
-
-
-@torch.no_grad()
-def concat_all_gather(tensor):
-    """
-    Performs all_gather operation on the provided tensors.
-    *** Warning ***: torch.distributed.all_gather has no gradient.
-    """
-    tensors_gather = [torch.ones_like(tensor)
-        for _ in range(torch.distributed.get_world_size())]
-    torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
-
-    output = torch.cat(tensors_gather, dim=0)
-    return output
-
-def default(val, def_val):
-    return def_val if val is None else val
