@@ -131,8 +131,9 @@ class VisionTransformerForSimMIM(VisionTransformer):
 
     def forward(self, x, mask):
         x = self.patch_embed(x)
-
+        x = x.flatten(2).transpose(1, 2)
         assert mask is not None
+        
         B, L, _ = x.shape
 
         mask_token = self.mask_token.expand(B, L, -1)
@@ -192,7 +193,7 @@ class SimMIM(nn.Module):
 
         mask = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
         loss_recon = F.l1_loss(global_crop, x_rec, reduction='none')
-        mim_loss = (loss_recon * m ask).sum() / (mask.sum() + 1e-5) / self.in_chans
+        mim_loss = (loss_recon * mask).sum() / (mask.sum() + 1e-5) / self.in_chans
 
         momentum_outputs = []
         with torch.no_grad():  # no gradient
@@ -202,10 +203,12 @@ class SimMIM(nn.Module):
                 _, k = self.momentum_encoder(local_crops[i])
                 momentum_outputs.append(k.detach())
 
-        cl_loss = 0
+        cl_loss, n_cl_loss = 0.0, 0
         for i in range(len(momentum_outputs)):
             cl_loss += self.loss_fn(q, momentum_outputs[i]).mean()
+            n_cl_loss += 1
         
+        cl_loss = cl_loss / n_cl_loss
         return mim_loss, cl_loss
     
     @torch.jit.ignore
@@ -249,8 +252,7 @@ def build_simmim(config):
             drop_rate=config.MODEL.DROP_RATE,
             drop_path_rate=config.MODEL.DROP_PATH_RATE,
             ape=config.MODEL.SWIN.APE,
-            patch_norm=config.MODEL.SWIN.PATCH_NORM,
-            use_checkpoint=config.TRAIN.USE_CHECKPOINT)
+            patch_norm=config.MODEL.SWIN.PATCH_NORM)
         encoder_stride = 32
     elif model_type == 'vit':
         encoder = VisionTransformerForSimMIM(

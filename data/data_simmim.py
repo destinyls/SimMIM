@@ -12,6 +12,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torchvision.transforms as T
+from torchvision import transforms
+from PIL import Image
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.data._utils.collate import default_collate
 from torchvision.datasets import ImageFolder
@@ -65,10 +67,6 @@ class DataAugmentation(object):
             transforms.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
             transforms.RandomResizedCrop(192, scale=global_crops_scale, ratio=(3./4., 4./3.), interpolation=Image.BICUBIC),
             transforms.RandomHorizontalFlip(p=0.5),
-            '''
-            flip_and_color_jitter,
-            utils.GaussianBlur(1.0),
-            '''
             normalize,
         ])
         # transformation for the rest of global crops
@@ -76,8 +74,6 @@ class DataAugmentation(object):
             transforms.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
             transforms.RandomResizedCrop(192, scale=global_crops_scale, ratio=(3./4., 4./3.), interpolation=Image.BICUBIC),
             transforms.RandomHorizontalFlip(p=0.5),
-            utils.GaussianBlur(0.1),
-            utils.Solarization(0.2),
             normalize,
         ])
         # transformation for the local crops
@@ -85,10 +81,6 @@ class DataAugmentation(object):
         self.local_transfo = transforms.Compose([
             transforms.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
             transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=Image.BICUBIC),
-            '''
-            flip_and_color_jitter,
-            utils.GaussianBlur(p=0.5),
-            '''
             normalize,
         ])
 

@@ -142,13 +142,13 @@ def train_one_epoch(config, args, model, data_loader, optimizer, epoch, lr_sched
     total_epochs = config.TRAIN.EPOCHS
     start = time.time()
     end = time.time()
-    for idx, (img, mask, _) in enumerate(data_loader):
-        img = img.cuda(non_blocking=True)
+    for idx, (imgs, mask, _) in enumerate(data_loader):
+        images = [im.cuda(non_blocking=True) for im in imgs]
         mask = mask.cuda(non_blocking=True)
 
         if args.moco_m_cos:
             moco_m = adjust_moco_momentum(epoch + idx / num_steps, args, total_epochs)
-        mim_loss, cl_loss = model(img, mask, moco_m)
+        mim_loss, cl_loss = model(images, mask, moco_m)
         loss = mim_loss + cl_loss
         if config.TRAIN.ACCUMULATION_STEPS > 1:
             loss = loss / config.TRAIN.ACCUMULATION_STEPS
@@ -188,9 +188,9 @@ def train_one_epoch(config, args, model, data_loader, optimizer, epoch, lr_sched
             lr_scheduler.step_update(epoch * num_steps + idx)
 
         torch.cuda.synchronize()
-        loss_meter.update(loss.item(), img.size(0))
-        cl_loss_meter.update(cl_loss.item(), img.size(0))
-        mim_loss_meter.update(mim_loss.item(), img.size(0))
+        loss_meter.update(loss.item(), images[0].size(0))
+        cl_loss_meter.update(cl_loss.item(), images[0].size(0))
+        mim_loss_meter.update(mim_loss.item(), images[0].size(0))
         norm_meter.update(grad_norm)
         batch_time.update(time.time() - end)
         end = time.time()
