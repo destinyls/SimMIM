@@ -107,6 +107,7 @@ def main(config, args=None):
 
     if config.MODEL.RESUME:
         load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, logger)
+        model.syn_encoder_momentum_encoder()
 
     logger.info("Start training")
     start_time = time.time()
@@ -134,8 +135,6 @@ def train_one_epoch(config, args, model, data_loader, optimizer, epoch, lr_sched
     num_steps = len(data_loader)
     batch_time = AverageMeter()
     loss_meter = AverageMeter()
-    mim_loss_meter = AverageMeter()
-    cl_loss_meter = AverageMeter()
     norm_meter = AverageMeter()
 
     moco_m = args.moco_m
@@ -148,8 +147,7 @@ def train_one_epoch(config, args, model, data_loader, optimizer, epoch, lr_sched
 
         if args.moco_m_cos:
             moco_m = adjust_moco_momentum(epoch + idx / num_steps, args, total_epochs)
-        mim_loss, cl_loss = model(images, mask, moco_m)
-        loss = mim_loss + cl_loss
+        loss = model(images, mask, moco_m)
         if config.TRAIN.ACCUMULATION_STEPS > 1:
             loss = loss / config.TRAIN.ACCUMULATION_STEPS
             if config.AMP_OPT_LEVEL != "O0":
@@ -189,8 +187,6 @@ def train_one_epoch(config, args, model, data_loader, optimizer, epoch, lr_sched
 
         torch.cuda.synchronize()
         loss_meter.update(loss.item(), images[0].size(0))
-        cl_loss_meter.update(cl_loss.item(), images[0].size(0))
-        mim_loss_meter.update(mim_loss.item(), images[0].size(0))
         norm_meter.update(grad_norm)
         batch_time.update(time.time() - end)
         end = time.time()
@@ -204,8 +200,6 @@ def train_one_epoch(config, args, model, data_loader, optimizer, epoch, lr_sched
                 f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.6f}\t'
                 f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
                 f'total_loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
-                f'mim_loss {mim_loss_meter.val:.4f} ({mim_loss_meter.avg:.4f})\t'
-                f'cl_loss {cl_loss_meter.val:.4f} ({cl_loss_meter.avg:.4f})\t'
                 f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
                 f'mem {memory_used:.0f}MB')
     epoch_time = time.time() - start

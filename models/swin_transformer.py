@@ -560,6 +560,7 @@ class SwinTransformer(nn.Module):
         self.mlp_ratio = mlp_ratio
         self.return_all_tokens = return_all_tokens
         self.in_chans = in_chans
+        self.patch_size = patch_size
 
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
