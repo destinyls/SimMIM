@@ -184,32 +184,40 @@ class SimMIM(nn.Module):
         self.use_momentum = True
         self.predictor = MLP(dim=256, projection_size=256)
         
+    def forward(self, x, mask, epoch, m=0.99):
+        global_crop_t, global_crop_s, local_crops = x[0], x[1], x[2:]
 
-    def forward(self, x, mask, m=0.99):
-        global_crop, local_crops = x[0], x[0:]
-        z, q = self.encoder(global_crop, mask)
-        q = self.predictor(q)
+        # mim loss
+        z, out_sg = self.encoder(global_crop_s, mask)
+        out_sg = self.predictor(out_sg)
         x_rec = self.decoder(z)
-
         mask = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
-        loss_recon = F.l1_loss(global_crop, x_rec, reduction='none')
+        loss_recon = F.l1_loss(global_crop_s, x_rec, reduction='none')
         mim_loss = (loss_recon * mask).sum() / (mask.sum() + 1e-5) / self.in_chans
 
-        momentum_outputs = []
+        # contrast loss
+        student_outputs = []
+        for i in range(len(local_crops)):
+            _, out_sl = self.encoder(local_crops[i])
+            out_sl = self.predictor(out_sl)
+            student_outputs.append(out_sl)
+        student_outputs.append(out_sg)
+
+        teacher_outputs = []
         with torch.no_grad():  # no gradient
             self._update_momentum_encoder(m)  # update the momentum encoder
-            # compute momentum features as targets
-            for i in range(len(local_crops)):
-                _, k = self.momentum_encoder(local_crops[i])
-                momentum_outputs.append(k.detach())
+            _, out_tg = self.momentum_encoder(global_crop_t)
+            teacher_outputs.append(out_tg.detach())
 
         cl_loss, n_cl_loss = 0.0, 0
-        for i in range(len(momentum_outputs)):
-            cl_loss += self.loss_fn(q, momentum_outputs[i]).mean()
+        for i in range(len(student_outputs)):
+            cl_loss += self.loss_fn(teacher_outputs[0], student_outputs[i]).mean()
             n_cl_loss += 1
-        
         cl_loss = cl_loss / n_cl_loss
+
         return mim_loss, cl_loss
+
+
     
     @torch.jit.ignore
     def no_weight_decay(self):
