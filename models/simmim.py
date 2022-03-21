@@ -84,6 +84,7 @@ class SwinTransformerForSimMIM(SwinTransformer):
 
     def forward(self, x, mask=None):
         x = self.patch_embed(x)
+        x = x.flatten(2).transpose(1, 2)
         B, L, _ = x.shape
 
         if mask is not None:
@@ -105,12 +106,12 @@ class SwinTransformerForSimMIM(SwinTransformer):
         x = x.reshape(B, C, H, W)
 
         # stop gradient propagation
-        z = self.neck(x)
+        z = self.neck(x.detach())
         z = self.avg_pool(z)
         z = z.view(z.size(0), -1)
         out_projector = self.projector(z)
 
-        return x, out_projector
+        return out_projector
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -188,17 +189,18 @@ class SimMIM(nn.Module):
         global_crop_t, global_crop_s, local_crops = x[0], x[1], x[2:]
 
         # mim loss
-        z, out_sg = self.encoder(global_crop_s, mask)
+        out_sg = self.encoder(global_crop_s, mask)
         out_sg = self.predictor(out_sg)
+        '''
         x_rec = self.decoder(z)
         mask = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
         loss_recon = F.l1_loss(global_crop_s, x_rec, reduction='none')
         mim_loss = (loss_recon * mask).sum() / (mask.sum() + 1e-5) / self.in_chans
-
+        '''
         # contrast loss
         student_outputs = []
         for i in range(len(local_crops)):
-            _, out_sl = self.encoder(local_crops[i])
+            out_sl = self.encoder(local_crops[i])
             out_sl = self.predictor(out_sl)
             student_outputs.append(out_sl)
         student_outputs.append(out_sg)
@@ -206,7 +208,7 @@ class SimMIM(nn.Module):
         teacher_outputs = []
         with torch.no_grad():  # no gradient
             self._update_momentum_encoder(m)  # update the momentum encoder
-            _, out_tg = self.momentum_encoder(global_crop_t)
+            out_tg = self.momentum_encoder(global_crop_t)
             teacher_outputs.append(out_tg.detach())
 
         cl_loss, n_cl_loss = 0.0, 0
@@ -214,10 +216,7 @@ class SimMIM(nn.Module):
             cl_loss += self.loss_fn(teacher_outputs[0], student_outputs[i]).mean()
             n_cl_loss += 1
         cl_loss = cl_loss / n_cl_loss
-
-        return mim_loss, cl_loss
-
-
+        return cl_loss
     
     @torch.jit.ignore
     def no_weight_decay(self):
