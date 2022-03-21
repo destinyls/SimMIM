@@ -21,42 +21,21 @@ from .vision_transformer import VisionTransformer
 
 from .deconv_up import DeconvUp
 
-class MultiCropWrapper(nn.Module):
-    """
-    Perform forward pass separately on each resolution input.
-    The inputs corresponding to a single resolution are clubbed and single
-    forward is run on the same resolution inputs. Hence we do several
-    forward passes = number of different resolutions used. We then
-    concatenate all the output features and run the head forward on these
-    concatenated features.
-    """
-    def __init__(self, backbone, head):
-        super(MultiCropWrapper, self).__init__()
-        # disable layers dedicated to ImageNet labels classification
-        backbone.fc, backbone.head = nn.Identity(), nn.Identity()
-        self.backbone = backbone
-        self.head = head
+# exponential moving average
+class EMA():
+    def __init__(self, beta):
+        super().__init__()
+        self.beta = beta
 
-    def forward(self, x):
-        # convert to list
-        if not isinstance(x, list):
-            x = [x]
-        idx_crops = torch.cumsum(torch.unique_consecutive(
-            torch.tensor([inp.shape[-1] for inp in x]),
-            return_counts=True,
-        )[1], 0)
-        start_idx, output = 0, torch.empty(0).to(x[0].device)
-        for end_idx in idx_crops:
-            _out = self.backbone(torch.cat(x[start_idx: end_idx]))
-            # The output is a tuple with XCiT model. See:
-            # https://github.com/facebookresearch/xcit/blob/master/xcit.py#L404-L405
-            if isinstance(_out, tuple):
-                _out = _out[0]
-            # accumulate outputs
-            output = torch.cat((output, _out))
-            start_idx = end_idx
-        # Run the head forward on the concatenated features.
-        return self.head(output)
+    def update_average(self, old, new):
+        if old is None:
+            return new
+        return old * self.beta + (1 - self.beta) * new
+
+def update_moving_average(ema_updater, ma_model, current_model):
+    for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
+        old_weight, up_weight = ma_params.data, current_params.data
+        ma_params.data = ema_updater.update_average(old_weight, up_weight)
 
 class MLP(nn.Module):
     def __init__(self, dim, projection_size, hidden_size = 4096):
@@ -84,6 +63,7 @@ class SwinTransformerForSimMIM(SwinTransformer):
 
     def forward(self, x, mask=None):
         x = self.patch_embed(x)
+        x = x.flatten(2).transpose(1, 2)
         B, L, _ = x.shape
 
         if mask is not None:
@@ -105,12 +85,12 @@ class SwinTransformerForSimMIM(SwinTransformer):
         x = x.reshape(B, C, H, W)
 
         # stop gradient propagation
-        z = self.neck(x)
-        z = self.avg_pool(z)
-        z = z.view(z.size(0), -1)
-        out_projector = self.projector(z)
+        x = self.neck(x.detach())
+        x = self.avg_pool(x)
+        x = x.view(x.size(0), -1)
+        out_projector = self.projector(x)
 
-        return x, out_projector
+        return out_projector
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -183,30 +163,42 @@ class SimMIM(nn.Module):
         self.patch_size = self.encoder.patch_size
         self.use_momentum = True
         self.predictor = MLP(dim=256, projection_size=256)
+        self.target_ema_updater = EMA(beta=0.99)
+    
+    def syn_encoder_momentum_encoder(self):
+        for param_b, param_m in zip(self.encoder.parameters(), self.momentum_encoder.parameters()):
+            param_m.data.copy_(param_b.data)  # initialize
+            param_m.requires_grad = False  # not update by gradient
+
+    def update_moving_average(self):
+        assert self.use_momentum, 'you do not need to update the moving average, since you have turned off momentum for the target encoder'
+        assert self.momentum_encoder is not None, 'target encoder has not been created yet'
+        update_moving_average(self.target_ema_updater, self.momentum_encoder, self.encoder)
         
     def forward(self, x, mask, epoch, m=0.99):
         global_crop_t, global_crop_s, local_crops = x[0], x[1], x[2:]
 
         # mim loss
-        z, out_sg = self.encoder(global_crop_s, mask)
+        out_sg = self.encoder(global_crop_s, mask=None)
         out_sg = self.predictor(out_sg)
+        '''
         x_rec = self.decoder(z)
         mask = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
         loss_recon = F.l1_loss(global_crop_s, x_rec, reduction='none')
         mim_loss = (loss_recon * mask).sum() / (mask.sum() + 1e-5) / self.in_chans
-
+        '''
         # contrast loss
         student_outputs = []
         for i in range(len(local_crops)):
-            _, out_sl = self.encoder(local_crops[i])
+            out_sl = self.encoder(local_crops[i])
             out_sl = self.predictor(out_sl)
             student_outputs.append(out_sl)
         student_outputs.append(out_sg)
 
         teacher_outputs = []
-        with torch.no_grad():  # no gradient
-            self._update_momentum_encoder(m)  # update the momentum encoder
-            _, out_tg = self.momentum_encoder(global_crop_t)
+        with torch.no_grad():             # no gradient
+            self.update_moving_average()  # update the momentum encoder
+            out_tg = self.momentum_encoder(global_crop_t)
             teacher_outputs.append(out_tg.detach())
 
         cl_loss, n_cl_loss = 0.0, 0
@@ -214,10 +206,7 @@ class SimMIM(nn.Module):
             cl_loss += self.loss_fn(teacher_outputs[0], student_outputs[i]).mean()
             n_cl_loss += 1
         cl_loss = cl_loss / n_cl_loss
-
-        return mim_loss, cl_loss
-
-
+        return cl_loss
     
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -232,10 +221,10 @@ class SimMIM(nn.Module):
         return {}
     
     @torch.no_grad()
-    def _update_momentum_encoder(self, m):
-        """Momentum update of the momentum encoder"""
-        for param_b, param_m in zip(self.encoder.parameters(), self.momentum_encoder.parameters()):
-            param_m.data = param_m.data * m + param_b.data * (1. - m)
+    def update_moving_average(self):
+        assert self.use_momentum, 'you do not need to update the moving average, since you have turned off momentum for the target encoder'
+        assert self.momentum_encoder is not None, 'target encoder has not been created yet'
+        update_moving_average(self.target_ema_updater, self.momentum_encoder, self.encoder)
 
     def loss_fn(self, x, y):
         x = F.normalize(x, dim=-1, p=2)

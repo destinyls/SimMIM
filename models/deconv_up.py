@@ -12,12 +12,12 @@ class DeconvUp(nn.Module):
         # used for deconv layers
         self.inplanes = input_channels
         self.deconv_with_bias = False
-        self.out_channels = 64
+        self.out_channels = 256
         # used for deconv layers
 
         self.deconv_layers_1 = self._make_deconv_layer(256, 4)
-        self.deconv_layers_2 = self._make_deconv_layer(128, 4)
-        self.deconv_layers_3 = self._make_deconv_layer(64, 4)
+        self.deconv_layers_2 = self._make_deconv_layer(256, 4)
+        self.deconv_layers_3 = self._make_deconv_layer(256, 4)
         self.init_weights()
 
     def forward(self, x):

@@ -14,6 +14,7 @@ import torch.distributed as dist
 import torchvision.transforms as T
 from torchvision import transforms
 from PIL import Image
+from data import utils
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.data._utils.collate import default_collate
 from torchvision.datasets import ImageFolder
