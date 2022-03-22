@@ -67,7 +67,8 @@ class DataAugmentation(object):
         self.global_transfo1 = transforms.Compose([
             transforms.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
             transforms.RandomResizedCrop(192, scale=global_crops_scale, ratio=(3./4., 4./3.), interpolation=Image.BICUBIC),
-            transforms.RandomHorizontalFlip(p=0.5),
+            flip_and_color_jitter,
+            utils.GaussianBlur(p=0.5),
             normalize,
         ])
         # transformation for the rest of global crops for student model 
@@ -100,7 +101,7 @@ class DataAugmentation(object):
 
 class SimMIMTransform:
     def __init__(self, config):
-        self.transform_img = DataAugmentation(global_crops_scale=(0.67, 1.), local_crops_scale=(0.10, 0.4), global_crops_number=2, local_crops_number=5)
+        self.transform_img = DataAugmentation(global_crops_scale=(0.67, 1.), local_crops_scale=(0.10, 0.4), global_crops_number=2, local_crops_number=0)
         if config.MODEL.TYPE == 'swin':
             model_patch_size=config.MODEL.SWIN.PATCH_SIZE
         elif config.MODEL.TYPE == 'vit':

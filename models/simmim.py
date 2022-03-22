@@ -177,37 +177,24 @@ class SimMIM(nn.Module):
         update_moving_average(self.target_ema_updater, self.momentum_encoder, self.encoder)
         
     def forward(self, x, mask, epoch, m=0.99):
-        global_crop_t, global_crop_s, local_crops = x[0], x[1], x[2:]
-
-        # mim loss
-        out_sg = self.encoder(global_crop_s, mask=None)
-        out_sg = self.predictor(out_sg)
-        '''
-        x_rec = self.decoder(z)
-        mask = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
-        loss_recon = F.l1_loss(global_crop_s, x_rec, reduction='none')
-        mim_loss = (loss_recon * mask).sum() / (mask.sum() + 1e-5) / self.in_chans
-        '''
-        # contrast loss
-        student_outputs = []
-        for i in range(len(local_crops)):
-            out_sl = self.encoder(local_crops[i])
-            out_sl = self.predictor(out_sl)
-            student_outputs.append(out_sl)
-        student_outputs.append(out_sg)
-
-        teacher_outputs = []
+        img_one, img_two = x[0], x[1]
+        
+        out_sg_one = self.encoder(img_one)
+        out_sg_one = self.predictor(out_sg_one)
+        out_sg_two = self.encoder(img_two)
+        out_sg_two = self.predictor(out_sg_two)
+        
         with torch.no_grad():             # no gradient
             self.update_moving_average()  # update the momentum encoder
-            out_tg = self.momentum_encoder(global_crop_t)
-            teacher_outputs.append(out_tg.detach())
+            out_tg_one = self.momentum_encoder(img_one)
+            out_tg_one.detach_()
+            out_tg_two = self.momentum_encoder(img_two)
+            out_tg_two.detach_()
 
-        cl_loss, n_cl_loss = 0.0, 0
-        for i in range(len(student_outputs)):
-            cl_loss += self.loss_fn(teacher_outputs[0], student_outputs[i]).mean()
-            n_cl_loss += 1
-        cl_loss = cl_loss / n_cl_loss
-        return cl_loss
+        cl_loss_1 = self.loss_fn(out_sg_one, out_tg_two).mean()
+        cl_loss_2 = self.loss_fn(out_sg_two, out_tg_one).mean()
+
+        return cl_loss_1 + cl_loss_2
     
     @torch.jit.ignore
     def no_weight_decay(self):
