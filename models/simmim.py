@@ -85,7 +85,7 @@ class SwinTransformerForSimMIM(SwinTransformer):
         x = x.reshape(B, C, H, W)
 
         # stop gradient propagation
-        x = self.neck(x.detach())
+        x = self.neck(x)
         x = self.avg_pool(x)
         x = x.view(x.size(0), -1)
         out_projector = self.projector(x)
@@ -152,13 +152,14 @@ class SimMIM(nn.Module):
             param_m.requires_grad = False  # not update by gradient
 
         self.encoder_stride = encoder_stride
+        '''
         self.decoder = nn.Sequential(
             nn.Conv2d(
                 in_channels=self.encoder.num_features,
                 out_channels=self.encoder_stride ** 2 * 3, kernel_size=1),
             nn.PixelShuffle(self.encoder_stride),
         )
-
+        '''
         self.in_chans = self.encoder.in_chans
         self.patch_size = self.encoder.patch_size
         self.use_momentum = True
