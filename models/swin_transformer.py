@@ -805,7 +805,7 @@ class SwinTransformer(nn.Module):
             if (
                     name.split('.')[0] in frozen_layers
                     or '.'.join(name.split('.')[0:2]) in frozen_layers
-                    or (len(frozen_layers) > 0 and frozen_layers[0] is '*')
+                    or (len(frozen_layers) > 0 and frozen_layers[0] == '*')
             ):
                 for _name, param in module.named_parameters():
                     param.requires_grad = False

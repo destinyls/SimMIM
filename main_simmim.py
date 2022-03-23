@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
+import torch.nn as nn
 from timm.utils import AverageMeter
 
 from config import get_config
@@ -26,12 +27,13 @@ from optimizer import build_optimizer
 from logger import create_logger
 from utils import load_checkpoint, save_checkpoint, get_grad_norm, auto_resume_helper
 
+from data import utils
+
 try:
     # noinspection PyUnresolvedReferences
     from apex import amp
 except ImportError:
     amp = None
-
 
 def parse_option():
     parser = argparse.ArgumentParser('SimMIM pre-training script', add_help=False)
@@ -65,9 +67,7 @@ def parse_option():
                          'half-cycle cosine schedule')
 
     args = parser.parse_args()
-
     config = get_config(args)
-
     return args, config
 
 
@@ -76,19 +76,50 @@ def main(config, args=None):
 
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     model = build_model(config, is_pretrain=True)
-    model.cuda()
-    logger.info(str(model))
+    student = utils.MultiCropWrapper(model, utils.DINOHead(in_dim=model.encoder_features, out_dim=65535))
+    teacher = utils.MultiCropWrapper(model, utils.DINOHead(in_dim=model.encoder_features, out_dim=65535))
+    # move networks to gpu
+    student, teacher = student.cuda(), teacher.cuda()
 
-    optimizer = build_optimizer(config, model, logger, is_pretrain=True)
+    optimizer = build_optimizer(config, student, logger, is_pretrain=True)
     if config.AMP_OPT_LEVEL != "O0":
-        model, optimizer = amp.initialize(model, optimizer, opt_level=config.AMP_OPT_LEVEL)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.LOCAL_RANK], broadcast_buffers=False)
-    model_without_ddp = model.module
+        student, optimizer = amp.initialize(student, optimizer, opt_level=config.AMP_OPT_LEVEL)
+    
+    # synchronize batch norms (if any)
+    if utils.has_batchnorms(student):
+        student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
+        teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        # we need DDP wrapper to have synchro batch norms working...
+        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[config.LOCAL_RANK], broadcast_buffers=False, find_unused_parameters=True)
+        teacher_without_ddp = teacher.module
+    else:
+        # teacher_without_ddp and teacher are the same thing
+        teacher_without_ddp = teacher
+        
+    student = nn.parallel.DistributedDataParallel(student, device_ids=[config.LOCAL_RANK], broadcast_buffers=False, find_unused_parameters=True)
+    student.train()
+    student_without_ddp = student.module
+    # teacher and student start with the same weights
+    teacher_without_ddp.load_state_dict(student.module.state_dict())
+    # there is no backpropagation through the teacher, so no need for gradients
+    for p in teacher.parameters():
+        p.requires_grad = False
+    logger.info(str(student))
+
+    # ============ preparing loss ... ============
+    dino_loss = utils.DINOLoss(
+        out_dim = 65535,
+        ncrops = 8 + 2,
+        warmup_teacher_temp = 0.04,
+        teacher_temp = 0.04,
+        warmup_teacher_temp_epochs = 30,
+        nepochs = 100).cuda()
+
+    n_parameters = sum(p.numel() for p in student.parameters() if p.requires_grad)
     logger.info(f"number of params: {n_parameters}")
-    if hasattr(model_without_ddp, 'flops'):
-        flops = model_without_ddp.flops()
+    if hasattr(student_without_ddp, 'flops'):
+        flops = student_without_ddp.flops()
         logger.info(f"number of GFLOPs: {flops / 1e9}")
 
     lr_scheduler = build_scheduler(config, optimizer, len(data_loader_train))
@@ -106,50 +137,45 @@ def main(config, args=None):
             logger.info(f'no checkpoint found in {config.OUTPUT}, ignoring auto resume')
 
     if config.MODEL.RESUME:
-        load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, logger)
+        load_checkpoint(config, student_without_ddp, optimizer, lr_scheduler, logger)
+        teacher_without_ddp.load_state_dict(student.module.state_dict())
 
     logger.info("Start training")
     start_time = time.time()
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(config, args, model, data_loader_train, optimizer, epoch, lr_scheduler)
+        train_one_epoch(config, args, student, teacher, teacher_without_ddp, dino_loss, data_loader_train, optimizer, epoch, lr_scheduler)
         if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
-            save_checkpoint(config, epoch, model_without_ddp, 0., optimizer, lr_scheduler, logger)
+            save_checkpoint(config, epoch, student_without_ddp, 0., optimizer, lr_scheduler, logger)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info('Training time {}'.format(total_time_str))
 
-
-def adjust_moco_momentum(epoch, args, total_epochs):
-    """Adjust moco momentum based on current epoch"""
-    m = 1. - 0.5 * (1. + math.cos(math.pi * epoch / total_epochs)) * (1. - args.moco_m)
-    return m
-
-def train_one_epoch(config, args, model, data_loader, optimizer, epoch, lr_scheduler):
-    model.train()
+def train_one_epoch(config, args, student, teacher, teacher_without_ddp, dino_loss, data_loader, optimizer, epoch, lr_scheduler):
     optimizer.zero_grad()
 
     num_steps = len(data_loader)
     batch_time = AverageMeter()
     loss_meter = AverageMeter()
-    mim_loss_meter = AverageMeter()
-    cl_loss_meter = AverageMeter()
     norm_meter = AverageMeter()
 
-    moco_m = args.moco_m
     total_epochs = config.TRAIN.EPOCHS
     start = time.time()
     end = time.time()
+
+    # momentum parameter is increased to 1. during training with a cosine schedule
+    momentum_schedule = utils.cosine_scheduler(base_value=0.996, final_value=1, epochs=100, niter_per_ep=len(data_loader))
+    
     for idx, (imgs, mask, _) in enumerate(data_loader):
         images = [im.cuda(non_blocking=True) for im in imgs]
         mask = mask.cuda(non_blocking=True)
 
-        if args.moco_m_cos:
-            moco_m = adjust_moco_momentum(epoch + idx / num_steps, args, total_epochs)
-        mim_loss, cl_loss = model(images, mask, moco_m)
-        loss = mim_loss + cl_loss
+        teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
+        student_output = student(images)
+        loss = dino_loss(student_output, teacher_output, epoch)
+
         if config.TRAIN.ACCUMULATION_STEPS > 1:
             loss = loss / config.TRAIN.ACCUMULATION_STEPS
             if config.AMP_OPT_LEVEL != "O0":
@@ -187,10 +213,14 @@ def train_one_epoch(config, args, model, data_loader, optimizer, epoch, lr_sched
             optimizer.step()
             lr_scheduler.step_update(epoch * num_steps + idx)
 
+        # EMA update for the teacher
+        with torch.no_grad():
+            m = momentum_schedule[idx]  # momentum parameter
+            for param_q, param_k in zip(student.module.parameters(), teacher_without_ddp.parameters()):
+                param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+
         torch.cuda.synchronize()
         loss_meter.update(loss.item(), images[0].size(0))
-        cl_loss_meter.update(cl_loss.item(), images[0].size(0))
-        mim_loss_meter.update(mim_loss.item(), images[0].size(0))
         norm_meter.update(grad_norm)
         batch_time.update(time.time() - end)
         end = time.time()
@@ -204,8 +234,6 @@ def train_one_epoch(config, args, model, data_loader, optimizer, epoch, lr_sched
                 f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.6f}\t'
                 f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
                 f'total_loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
-                f'mim_loss {mim_loss_meter.val:.4f} ({mim_loss_meter.avg:.4f})\t'
-                f'cl_loss {cl_loss_meter.val:.4f} ({cl_loss_meter.avg:.4f})\t'
                 f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
                 f'mem {memory_used:.0f}MB')
     epoch_time = time.time() - start

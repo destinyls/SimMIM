@@ -20,43 +20,7 @@ from .swin_transformer import SwinTransformer
 from .vision_transformer import VisionTransformer
 
 from .deconv_up import DeconvUp
-
-class MultiCropWrapper(nn.Module):
-    """
-    Perform forward pass separately on each resolution input.
-    The inputs corresponding to a single resolution are clubbed and single
-    forward is run on the same resolution inputs. Hence we do several
-    forward passes = number of different resolutions used. We then
-    concatenate all the output features and run the head forward on these
-    concatenated features.
-    """
-    def __init__(self, backbone, head):
-        super(MultiCropWrapper, self).__init__()
-        # disable layers dedicated to ImageNet labels classification
-        backbone.fc, backbone.head = nn.Identity(), nn.Identity()
-        self.backbone = backbone
-        self.head = head
-
-    def forward(self, x):
-        # convert to list
-        if not isinstance(x, list):
-            x = [x]
-        idx_crops = torch.cumsum(torch.unique_consecutive(
-            torch.tensor([inp.shape[-1] for inp in x]),
-            return_counts=True,
-        )[1], 0)
-        start_idx, output = 0, torch.empty(0).to(x[0].device)
-        for end_idx in idx_crops:
-            _out = self.backbone(torch.cat(x[start_idx: end_idx]))
-            # The output is a tuple with XCiT model. See:
-            # https://github.com/facebookresearch/xcit/blob/master/xcit.py#L404-L405
-            if isinstance(_out, tuple):
-                _out = _out[0]
-            # accumulate outputs
-            output = torch.cat((output, _out))
-            start_idx = end_idx
-        # Run the head forward on the concatenated features.
-        return self.head(output)
+from data import utils
 
 class MLP(nn.Module):
     def __init__(self, dim, projection_size, hidden_size = 4096):
@@ -78,12 +42,15 @@ class SwinTransformerForSimMIM(SwinTransformer):
         assert self.num_classes == 0
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         trunc_normal_(self.mask_token, mean=0., std=.02)
+        '''
         self.neck = DeconvUp(input_channels=self.num_features)
         self.projector = MLP(dim=self.neck.out_channels, projection_size=256)
+        '''
         self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
 
     def forward(self, x, mask=None):
         x = self.patch_embed(x)
+        x = x.flatten(2).transpose(1, 2)
         B, L, _ = x.shape
 
         if mask is not None:
@@ -105,12 +72,15 @@ class SwinTransformerForSimMIM(SwinTransformer):
         x = x.reshape(B, C, H, W)
 
         # stop gradient propagation
-        z = self.neck(x)
-        z = self.avg_pool(z)
-        z = z.view(z.size(0), -1)
+        '''
+        x = self.neck(x)
+        '''
+        x = self.avg_pool(x)
+        x = x.view(x.size(0), -1)
+        '''
         out_projector = self.projector(z)
-
-        return x, out_projector
+        '''
+        return x
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -161,55 +131,15 @@ class VisionTransformerForSimMIM(VisionTransformer):
 class SimMIM(nn.Module):
     def __init__(self, encoder, encoder_stride):
         super().__init__()
-        '''
-        neck = DeconvUp(input_channels=encoder.num_features)
-        projector = self._build_mlp(num_layers=3, input_dim=neck.out_channels, mlp_dim=4096, output_dim=256)
-        '''
         self.encoder = encoder
-        self.momentum_encoder = copy.deepcopy(self.encoder)
-        for param_b, param_m in zip(self.encoder.parameters(), self.momentum_encoder.parameters()):
-            param_m.data.copy_(param_b.data)  # initialize
-            param_m.requires_grad = False  # not update by gradient
+        self.encoder_features = encoder.num_features
+        self.in_chans = encoder.in_chans
 
-        self.encoder_stride = encoder_stride
-        self.decoder = nn.Sequential(
-            nn.Conv2d(
-                in_channels=self.encoder.num_features,
-                out_channels=self.encoder_stride ** 2 * 3, kernel_size=1),
-            nn.PixelShuffle(self.encoder_stride),
-        )
-
-        self.in_chans = self.encoder.in_chans
-        self.patch_size = self.encoder.patch_size
         self.use_momentum = True
-        self.predictor = MLP(dim=256, projection_size=256)
-        
 
-    def forward(self, x, mask, m=0.99):
-        global_crop, local_crops = x[0], x[0:]
-        z, q = self.encoder(global_crop, mask)
-        q = self.predictor(q)
-        x_rec = self.decoder(z)
-
-        mask = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
-        loss_recon = F.l1_loss(global_crop, x_rec, reduction='none')
-        mim_loss = (loss_recon * mask).sum() / (mask.sum() + 1e-5) / self.in_chans
-
-        momentum_outputs = []
-        with torch.no_grad():  # no gradient
-            self._update_momentum_encoder(m)  # update the momentum encoder
-            # compute momentum features as targets
-            for i in range(len(local_crops)):
-                _, k = self.momentum_encoder(local_crops[i])
-                momentum_outputs.append(k.detach())
-
-        cl_loss, n_cl_loss = 0.0, 0
-        for i in range(len(momentum_outputs)):
-            cl_loss += self.loss_fn(q, momentum_outputs[i]).mean()
-            n_cl_loss += 1
-        
-        cl_loss = cl_loss / n_cl_loss
-        return mim_loss, cl_loss
+    def forward(self, x, mask=None):
+        x = self.encoder(x)
+        return x
     
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -280,3 +210,6 @@ def build_simmim(config):
     model = SimMIM(encoder=encoder, encoder_stride=encoder_stride)
 
     return model
+
+
+
