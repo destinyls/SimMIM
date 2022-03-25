@@ -6,10 +6,14 @@
 # Modified by Zhenda Xie
 # --------------------------------------------------------
 
+import os
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+
+from models.utils import load_checkpoint
+from mmdet.utils import get_root_logger
 
 
 class Mlp(nn.Module):
@@ -553,6 +557,18 @@ class SwinTransformer(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
+    def init_weights(self, pretrained=None):
+        """Initialize the weights in backbone.
+        Args:
+            pretrained (str, optional): Path to pre-trained weights.
+                Defaults to None.
+        """
+        if isinstance(pretrained, str):
+            logger = get_root_logger()
+            load_checkpoint(self, pretrained, strict=False, logger=logger)
+        else:
+            raise TypeError('pretrained must be a str or None')
+
     @torch.jit.ignore
     def no_weight_decay(self):
         return {'absolute_pos_embed'}
@@ -590,7 +606,7 @@ class SwinTransformer(nn.Module):
         return flops
 
 
-def build_swin(config):
+def build_swin(config, pretrained=None):
     model = SwinTransformer(
         img_size=config.DATA.IMG_SIZE,
         patch_size=config.MODEL.SWIN.PATCH_SIZE,
@@ -608,5 +624,8 @@ def build_swin(config):
         ape=config.MODEL.SWIN.APE,
         patch_norm=config.MODEL.SWIN.PATCH_NORM,
         use_checkpoint=config.TRAIN.USE_CHECKPOINT)
+    
+    if pretrained is not None:
+        model.init_weights(pretrained=pretrained)
 
     return model
