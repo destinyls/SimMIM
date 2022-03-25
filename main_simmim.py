@@ -72,19 +72,19 @@ def parse_option():
 
 
 def main(config, args=None):
+    utils.init_distributed_mode(args)
+    utils.fix_random_seeds(args.seed)
+    print("git:\n  {}\n".format(utils.get_sha()))
     data_loader_train = build_loader(config, logger, is_pretrain=True)
 
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
-    model = build_model(config, is_pretrain=True)
-    student = utils.MultiCropWrapper(model, utils.DINOHead(in_dim=model.encoder_features, out_dim=65535))
-    teacher = utils.MultiCropWrapper(model, utils.DINOHead(in_dim=model.encoder_features, out_dim=65535))
+    student = build_model(config, is_pretrain=True)
+    teacher = build_model(config, is_pretrain=True)
+    student = utils.MultiCropWrapper(student, utils.DINOHead(in_dim=student.encoder_features, out_dim=65535))
+    teacher = utils.MultiCropWrapper(teacher, utils.DINOHead(in_dim=teacher.encoder_features, out_dim=65535))
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
 
-    optimizer = build_optimizer(config, student, logger, is_pretrain=True)
-    if config.AMP_OPT_LEVEL != "O0":
-        student, optimizer = amp.initialize(student, optimizer, opt_level=config.AMP_OPT_LEVEL)
-    
     # synchronize batch norms (if any)
     if utils.has_batchnorms(student):
         student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
@@ -98,7 +98,6 @@ def main(config, args=None):
         teacher_without_ddp = teacher
         
     student = nn.parallel.DistributedDataParallel(student, device_ids=[config.LOCAL_RANK], broadcast_buffers=False, find_unused_parameters=True)
-    student.train()
     student_without_ddp = student.module
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
@@ -114,15 +113,40 @@ def main(config, args=None):
         warmup_teacher_temp = 0.04,
         teacher_temp = 0.04,
         warmup_teacher_temp_epochs = 30,
-        nepochs = 100).cuda()
+        nepochs = config.TRAIN.EPOCHS).cuda()
+
+    '''
+    optimizer = build_optimizer(config, student, logger, is_pretrain=True)
+    '''
+    # ============ preparing optimizer ... ============
+    opt_lower = config.TRAIN.OPTIMIZER.NAME.lower()    
+    params_groups = utils.get_params_groups(student)
+    if opt_lower == "adamw":
+        optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
+    elif opt_lower == "sgd":
+        optimizer = torch.optim.SGD(params_groups, lr=0, momentum=0.9)  # lr is set by scheduler
+    elif opt_lower == "lars":
+        optimizer = utils.LARS(params_groups)  # to use with convnet and large batches
+
+    # ============ init schedulers ... ============
+    lr_schedule = utils.cosine_scheduler(
+        0.0005 * (config.DATA.BATCH_SIZE * utils.get_world_size()) / 256.,  # linear scaling rule
+        1e-6,
+        config.TRAIN.EPOCHS, len(data_loader_train),
+        warmup_epochs=10,
+    )
+    wd_schedule = utils.cosine_scheduler(0.04, 0.4, config.TRAIN.EPOCHS, len(data_loader_train))
+
+    # for mixed precision training
+    fp16_scaler = None
+    if args.use_fp16:
+        fp16_scaler = torch.cuda.amp.GradScaler()
 
     n_parameters = sum(p.numel() for p in student.parameters() if p.requires_grad)
     logger.info(f"number of params: {n_parameters}")
     if hasattr(student_without_ddp, 'flops'):
         flops = student_without_ddp.flops()
         logger.info(f"number of GFLOPs: {flops / 1e9}")
-
-    lr_scheduler = build_scheduler(config, optimizer, len(data_loader_train))
 
     if config.TRAIN.AUTO_RESUME:
         resume_file = auto_resume_helper(config.OUTPUT, logger)
@@ -145,7 +169,7 @@ def main(config, args=None):
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(config, args, student, teacher, teacher_without_ddp, dino_loss, data_loader_train, optimizer, epoch, lr_scheduler)
+        train_one_epoch(config, args, student, teacher, teacher_without_ddp, dino_loss, data_loader_train, optimizer, epoch, lr_scheduler, fp16_scaler)
         if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
             save_checkpoint(config, epoch, student_without_ddp, 0., optimizer, lr_scheduler, logger)
 
@@ -153,65 +177,59 @@ def main(config, args=None):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info('Training time {}'.format(total_time_str))
 
-def train_one_epoch(config, args, student, teacher, teacher_without_ddp, dino_loss, data_loader, optimizer, epoch, lr_scheduler):
+def train_one_epoch(config, args, student, teacher, teacher_without_ddp, dino_loss, data_loader, optimizer, epoch, lr_scheduler, fp16_scaler):
     optimizer.zero_grad()
 
     num_steps = len(data_loader)
     batch_time = AverageMeter()
+    lr_meter = AverageMeter()
+    weight_decay_meter = AverageMeter()
     loss_meter = AverageMeter()
     norm_meter = AverageMeter()
 
     total_epochs = config.TRAIN.EPOCHS
-    start = time.time()
-    end = time.time()
+    start, end = time.time(), time.time()
 
     # momentum parameter is increased to 1. during training with a cosine schedule
     momentum_schedule = utils.cosine_scheduler(base_value=0.996, final_value=1, epochs=100, niter_per_ep=len(data_loader))
     
     for idx, (imgs, mask, _) in enumerate(data_loader):
+        for i, param_group in enumerate(optimizer.param_groups):
+            param_group["lr"] = lr_schedule[it]
+            if i == 0:  # only the first group is regularized
+                param_group["weight_decay"] = wd_schedule[it]
+
+        # move images to gpu
         images = [im.cuda(non_blocking=True) for im in imgs]
         mask = mask.cuda(non_blocking=True)
 
-        teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
-        student_output = student(images)
-        loss = dino_loss(student_output, teacher_output, epoch)
+        with torch.cuda.amp.autocast(fp16_scaler is not None):
+            teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
+            student_output = student(images)
+            loss = dino_loss(student_output, teacher_output, epoch)
 
-        if config.TRAIN.ACCUMULATION_STEPS > 1:
-            loss = loss / config.TRAIN.ACCUMULATION_STEPS
-            if config.AMP_OPT_LEVEL != "O0":
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                if config.TRAIN.CLIP_GRAD:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.TRAIN.CLIP_GRAD)
-                else:
-                    grad_norm = get_grad_norm(amp.master_params(optimizer))
-            else:
-                loss.backward()
-                if config.TRAIN.CLIP_GRAD:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
-                else:
-                    grad_norm = get_grad_norm(model.parameters())
-            if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-                lr_scheduler.step_update(epoch * num_steps + idx)
-        else:
-            optimizer.zero_grad()
-            if config.AMP_OPT_LEVEL != "O0":
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                if config.TRAIN.CLIP_GRAD:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.TRAIN.CLIP_GRAD)
-                else:
-                    grad_norm = get_grad_norm(amp.master_params(optimizer))
-            else:
-                loss.backward()
-                if config.TRAIN.CLIP_GRAD:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
-                else:
-                    grad_norm = get_grad_norm(model.parameters())
+        if not math.isfinite(loss.item()):
+            print("Loss is {}, stopping training".format(loss.item()), force=True)
+            sys.exit(1)
+
+        # student update
+        optimizer.zero_grad()
+        param_norms = None
+        if fp16_scaler is None:
+            loss.backward()
+            if args.clip_grad:
+                param_norms = utils.clip_gradients(student, args.clip_grad)
+            utils.cancel_gradients_last_layer(epoch, student, args.freeze_last_layer)
             optimizer.step()
-            lr_scheduler.step_update(epoch * num_steps + idx)
+        else:
+            fp16_scaler.scale(loss).backward()
+            if args.clip_grad:
+                fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
+                param_norms = utils.clip_gradients(student, args.clip_grad)
+            utils.cancel_gradients_last_layer(epoch, student,
+                                              args.freeze_last_layer)
+            fp16_scaler.step(optimizer)
+            fp16_scaler.update()
 
         # EMA update for the teacher
         with torch.no_grad():
@@ -222,6 +240,8 @@ def train_one_epoch(config, args, student, teacher, teacher_without_ddp, dino_lo
         torch.cuda.synchronize()
         loss_meter.update(loss.item(), images[0].size(0))
         norm_meter.update(grad_norm)
+        lr_meter.update(optimizer.param_groups[0]["lr"])
+        weight_decay_meter.update(optimizer.param_groups[0]["weight_decay"])
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -234,6 +254,8 @@ def train_one_epoch(config, args, student, teacher, teacher_without_ddp, dino_lo
                 f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.6f}\t'
                 f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
                 f'total_loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
+                f'lr {lr_meter.val:.4f}({lr_meter.avg:.4f})\t'
+                f'weight_decay {weight_decay_meter.val:.4f}({weight_decay_meter.avg:.4f})\t'
                 f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
                 f'mem {memory_used:.0f}MB')
     epoch_time = time.time() - start
