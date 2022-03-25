@@ -65,6 +65,9 @@ def parse_option():
     parser.add_argument('--moco-m-cos', action='store_true',
                     help='gradually increase moco momentum to 1 with a '
                          'half-cycle cosine schedule')
+    parser.add_argument('--clip_grad', type=float, default=3.0, help="""Maximal parameter
+        gradient norm if using gradient clipping. Clipping with norm .3 ~ 1.0 can
+        help optimization for larger ViT architectures. 0 for disabling.""")
 
     args = parser.parse_args()
     config = get_config(args)
@@ -72,9 +75,6 @@ def parse_option():
 
 
 def main(config, args=None):
-    utils.init_distributed_mode(args)
-    utils.fix_random_seeds(args.seed)
-    print("git:\n  {}\n".format(utils.get_sha()))
     data_loader_train = build_loader(config, logger, is_pretrain=True)
 
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
@@ -207,7 +207,6 @@ def train_one_epoch(config, args, student, teacher, teacher_without_ddp, dino_lo
             teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
             student_output = student(images)
             loss = dino_loss(student_output, teacher_output, epoch)
-
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
             sys.exit(1)
