@@ -85,12 +85,12 @@ class SwinTransformerForSimMIM(SwinTransformer):
         x = x.reshape(B, C, H, W)
 
         # stop gradient propagation
-        x = self.neck(x)
-        x = self.avg_pool(x)
-        x = x.view(x.size(0), -1)
-        out_projector = self.projector(x)
+        z = self.neck(x)
+        q = self.avg_pool(z)
+        q = q.view(q.size(0), -1)
+        q = self.projector(q)
 
-        return out_projector
+        return z, q
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -141,10 +141,7 @@ class VisionTransformerForSimMIM(VisionTransformer):
 class SimMIM(nn.Module):
     def __init__(self, encoder, encoder_stride):
         super().__init__()
-        '''
-        neck = DeconvUp(input_channels=encoder.num_features)
-        projector = self._build_mlp(num_layers=3, input_dim=neck.out_channels, mlp_dim=4096, output_dim=256)
-        '''
+        self.neck = DeconvUp(input_channels=encoder.num_features)
         self.encoder = encoder
         self.momentum_encoder = copy.deepcopy(self.encoder)
         for param_b, param_m in zip(self.encoder.parameters(), self.momentum_encoder.parameters()):
@@ -152,14 +149,13 @@ class SimMIM(nn.Module):
             param_m.requires_grad = False  # not update by gradient
 
         self.encoder_stride = encoder_stride
-        '''
         self.decoder = nn.Sequential(
             nn.Conv2d(
                 in_channels=self.encoder.num_features,
                 out_channels=self.encoder_stride ** 2 * 3, kernel_size=1),
             nn.PixelShuffle(self.encoder_stride),
         )
-        '''
+        
         self.in_chans = self.encoder.in_chans
         self.patch_size = self.encoder.patch_size
         self.use_momentum = True
@@ -179,10 +175,15 @@ class SimMIM(nn.Module):
     def forward(self, x, mask, epoch, m=0.99):
         img_one, img_two = x[0], x[1]
         
-        out_sg_one = self.encoder(img_one)
+        z, out_sg_one = self.encoder(img_one, mask)
         out_sg_one = self.predictor(out_sg_one)
-        out_sg_two = self.encoder(img_two)
+        _, out_sg_two = self.encoder(img_two)
         out_sg_two = self.predictor(out_sg_two)
+
+        x_rec = self.decoder(z)
+        mask = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
+        loss_recon = F.l1_loss(img_one, x_rec, reduction='none')
+        mim_loss = (loss_recon * m ask).sum() / (mask.sum() + 1e-5) / self.in_chans
         
         with torch.no_grad():             # no gradient
             self.update_moving_average()  # update the momentum encoder
@@ -194,7 +195,7 @@ class SimMIM(nn.Module):
         cl_loss_1 = self.loss_fn(out_sg_one, out_tg_two).mean()
         cl_loss_2 = self.loss_fn(out_sg_two, out_tg_one).mean()
 
-        return cl_loss_1 + cl_loss_2
+        return mim_loss, cl_loss_1 + cl_loss_2
     
     @torch.jit.ignore
     def no_weight_decay(self):
