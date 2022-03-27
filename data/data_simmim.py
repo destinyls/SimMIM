@@ -52,7 +52,7 @@ class SimMIMTransform:
             T.RandomResizedCrop(config.DATA.IMG_SIZE, scale=(0.67, 1.), ratio=(3. / 4., 4. / 3.)),
             T.RandomHorizontalFlip(),
             T.ToTensor(),
-            # T.Normalize(mean=torch.tensor(IMAGENET_DEFAULT_MEAN),std=torch.tensor(IMAGENET_DEFAULT_STD)),
+            T.Normalize(mean=torch.tensor(IMAGENET_DEFAULT_MEAN),std=torch.tensor(IMAGENET_DEFAULT_STD)),
         ])
  
         if config.MODEL.TYPE == 'swin':

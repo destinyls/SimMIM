@@ -45,23 +45,6 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-'''
-image_size = 192
-DEFAULT_AUG = torch.nn.Sequential(
-    RandomApply(
-        T.ColorJitter(0.8, 0.8, 0.8, 0.2),
-        p = 0.3
-    ),
-    T.RandomGrayscale(p=0.2),
-    T.RandomHorizontalFlip(),
-    RandomApply(
-        T.GaussianBlur((3, 3), (1.0, 2.0)),
-        p = 0.2
-    ),
-    T.RandomResizedCrop((image_size, image_size)),
-    T.Normalize(mean=torch.tensor(IMAGENET_DEFAULT_MEAN),std=torch.tensor(IMAGENET_DEFAULT_STD)),
-)
-'''
 
 class SwinTransformerForSimMIM(SwinTransformer):
     def __init__(self, **kwargs):
@@ -70,8 +53,8 @@ class SwinTransformerForSimMIM(SwinTransformer):
         assert self.num_classes == 0
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         trunc_normal_(self.mask_token, mean=0., std=.02)
-        '''
         self.neck = DeconvUp(input_channels=self.num_features)
+        '''
         self.projector = MLP(dim=self.neck.out_channels, projection_size=256)
         '''
         self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
@@ -99,9 +82,7 @@ class SwinTransformerForSimMIM(SwinTransformer):
         x = x.reshape(B, C, H, W)
 
         # stop gradient propagation
-        '''
-        z = self.neck(x)
-        '''
+        z = self.neck(x)        
         z = self.avg_pool(x)
         z = z.view(z.size(0), -1)
         '''
@@ -157,10 +138,6 @@ class VisionTransformerForSimMIM(VisionTransformer):
 class SimMIM(nn.Module):
     def __init__(self, encoder, momentum_encoder, encoder_stride):
         super().__init__()
-        '''
-        neck = DeconvUp(input_channels=encoder.num_features)
-        projector = self._build_mlp(num_layers=3, input_dim=neck.out_channels, mlp_dim=4096, output_dim=256)
-        '''
         self.encoder = encoder
         self.momentum_encoder = momentum_encoder
         '''
@@ -168,7 +145,6 @@ class SimMIM(nn.Module):
             param_m.data.copy_(param_b.data)  # initialize
             param_m.requires_grad = False  # not update by gradient
         '''
-
         self.encoder_stride = encoder_stride
         self.decoder = nn.Sequential(
             nn.Conv2d(
@@ -184,16 +160,9 @@ class SimMIM(nn.Module):
         self.predictor = MLP(dim=256, projection_size=256)
         '''
         self.T = 1.0
-        '''
-        augment_fn = T.Normalize(mean=torch.tensor(IMAGENET_DEFAULT_MEAN),std=torch.tensor(IMAGENET_DEFAULT_STD))
-        self.augment1 = default(augment_fn, DEFAULT_AUG)
-        self.augment2 = default(None, DEFAULT_AUG)
-        '''
+
 
     def forward(self, x, mask, m=0.99):
-        '''
-        image_one, image_two = self.augment1(x), self.augment2(x)
-        '''
         z, q = self.encoder(x, mask)
         '''
         q = self.predictor(q)
@@ -299,9 +268,10 @@ def build_simmim(config):
 
     momentum_encoder = copy.deepcopy(encoder)
     model_url = "https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_base_patch4_window7_224.pth"
-    momentum_encoder.init_weights(model_url)
+    checkpoint = torch.hub.load_state_dict_from_url(model_url, map_location='cpu', check_hash=True)
+    msg = momentum_encoder.load_state_dict(checkpoint['model'], strict=False)
+    logger.info(msg)
     model = SimMIM(encoder=encoder, momentum_encoder=momentum_encoder, encoder_stride=encoder_stride)
-
     return model
 
 
